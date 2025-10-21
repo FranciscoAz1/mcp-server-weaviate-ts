@@ -14,6 +14,13 @@ async function testMCPServer() {
   // Start the server
   const serverProcess = spawn('node', [join(__dirname, '..', 'dist', 'main.js')], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      // Force stdio so the test can talk JSON-RPC over stdin/stdout regardless of the user's env
+      MCP_TRANSPORT: 'stdio',
+      // Optional: increase verbosity if needed
+      // MCP_LOG_LEVEL: 'debug',
+    },
   });
 
   let nextRequestId = 1;
@@ -65,6 +72,21 @@ async function testMCPServer() {
           query: 'hello',
           collection: 'Dataset',
           targetProperties: ['text', 'file_path'],
+          limit: 1
+        }
+      }
+    },
+    // Negative test: invalid collection to ensure we get a proper error response and the list of available collections
+    {
+      jsonrpc: '2.0',
+      id: nextRequestId++,
+      method: 'tools/call',
+      params: {
+        name: 'weaviate-query',
+        arguments: {
+          query: 'show me something',
+          collection: 'NonExistentCollection',
+          targetProperties: ['text'],
           limit: 1
         }
       }

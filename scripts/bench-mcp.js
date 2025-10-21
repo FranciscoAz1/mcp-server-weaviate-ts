@@ -16,7 +16,7 @@
 
 const MCP_URL = process.env.MCP_URL || 'http://127.0.0.1:3000/mcp';
 const TOOL = process.env.MCP_TOOL || 'weaviate-query';
-const COLLECTION = process.env.MCP_COLLECTION || 'Dataset';
+const COLLECTION = process.env.MCP_COLLECTION || 'LiHuaWorld';
 const PROPS = (process.env.MCP_PROPS || 'text,file_path').split(',').map(s => s.trim()).filter(Boolean);
 const QUERY = process.env.MCP_QUERY || 'hello';
 const LIMIT = Number(process.env.MCP_LIMIT || 1);

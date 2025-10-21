@@ -91,3 +91,5 @@ jspm_packages/
 # OS
 .DS_Store
 Thumbs.db
+benchmark_weaviate.ipynb
+package-lock.json

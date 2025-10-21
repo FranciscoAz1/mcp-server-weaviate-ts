@@ -20,8 +20,7 @@ const QUERY_INPUT_SHAPE = {
   query: z.string().min(1, 'query is required'),
   collection: z
     .string()
-    .min(1, 'collection cannot be empty')
-    .optional(),
+    .min(1, 'collection cannot be empty'),
   targetProperties: z
     .array(z.string().min(1))
     .min(1, 'targetProperties requires at least one property'),
@@ -37,8 +36,7 @@ const GENERATE_INPUT_SHAPE = {
   query: z.string().min(1, 'query is required'),
   collection: z
     .string()
-    .min(1, 'collection cannot be empty')
-    .optional(),
+    .min(1, 'collection cannot be empty'),
   targetProperties: z
     .array(z.string().min(1))
     .min(1, 'targetProperties requires at least one property'),
@@ -71,6 +69,8 @@ export class WeaviateMcpRuntime {
   private httpApp?: Express;
   private httpServer?: HttpServer;
   private collectionCache?: { names: string[]; fetchedAt: number };
+  private isShuttingDown = false;
+  private activeConnections = 0;
 
   constructor(config: Config, logger: Logger, version = '0.1.0') {
     this.config = config;
@@ -100,6 +100,16 @@ export class WeaviateMcpRuntime {
 
     this.server.server.onclose = () => {
       this.logger.info('Transport closed');
+      // For stdio mode: exit non-zero to let dev supervisors restart on client disconnect.
+      // For HTTP mode: the HTTP server remains healthy; don't exit here.
+      setImmediate(() => {
+        const isHttpMode = Boolean(this.httpServer);
+        if (!this.isShuttingDown && !isHttpMode) {
+          process.exitCode = 1;
+          // Give logger a tick to flush
+          setTimeout(() => process.exit(1), 10);
+        }
+      });
     };
 
     this.registerTools();
@@ -119,6 +129,13 @@ export class WeaviateMcpRuntime {
     };
     transport.onclose = () => {
       this.logger.info('STDIO transport closed');
+      // Exit to allow dev supervisor to restart on client disconnect
+      setImmediate(() => {
+        if (!this.isShuttingDown) {
+          process.exitCode = 1;
+          setTimeout(() => process.exit(1), 10);
+        }
+      });
     };
 
     await this.server.connect(transport);
@@ -141,6 +158,10 @@ export class WeaviateMcpRuntime {
       this.httpTransport.onerror = (error) => {
         this.logger.error('HTTP transport error: %s', error instanceof Error ? error.message : String(error));
       };
+      this.httpTransport.onclose = () => {
+        // Individual HTTP transport/session closures can occur; log and continue.
+        this.logger.warn('HTTP transport closed');
+      };
 
       await this.server.connect(this.httpTransport);
       this.logger.info('HTTP transport connected');
@@ -157,6 +178,36 @@ export class WeaviateMcpRuntime {
       this.httpApp.use(express.json({ limit: '4mb' }));
 
       const handler = async (req: express.Request, res: express.Response) => {
+        const reqId = randomUUID();
+        const startedAt = Date.now();
+        this.logger.debug(
+          'HTTP request start id=%s method=%s url=%s content-length=%s',
+          reqId,
+          req.method,
+          req.url,
+          req.headers['content-length'] ?? 'unknown'
+        );
+
+        res.on('finish', () => {
+          const dur = Date.now() - startedAt;
+          this.logger.debug(
+            'HTTP response finish id=%s status=%d durationMs=%d',
+            reqId,
+            res.statusCode,
+            dur
+          );
+        });
+
+        res.on('close', () => {
+          const dur = Date.now() - startedAt;
+          this.logger.debug('HTTP response close id=%s durationMs=%d', reqId, dur);
+        });
+
+        req.on('aborted', () => {
+          const dur = Date.now() - startedAt;
+          this.logger.warn('HTTP request aborted by client id=%s durationMs=%d', reqId, dur);
+        });
+
         if (!this.httpTransport) {
           res.status(503).json({
             jsonrpc: '2.0',
@@ -191,9 +242,42 @@ export class WeaviateMcpRuntime {
         resolve();
       });
 
+      // Tune server timeouts to reduce premature closes under load or slow clients
+      // Keep-Alive a bit over 60s, headers a bit longer, disable per-request timeout
+      server.keepAliveTimeout = 65_000; // default can be ~5s; extend to keep connections alive longer
+      server.headersTimeout = 66_000;   // must be > keepAliveTimeout
+  // 0 disables (no automatic timeout). If you prefer a limit, set e.g., 120_000
+  (server as unknown as { requestTimeout?: number }).requestTimeout = 0;
+
+      server.on('clientError', (err) => {
+        this.logger.warn('HTTP clientError: %s', err instanceof Error ? err.message : String(err));
+      });
+
+      server.on('connection', (socket) => {
+        this.activeConnections += 1;
+        this.logger.debug('HTTP connection opened, active=%d', this.activeConnections);
+        socket.on('close', () => {
+          this.activeConnections = Math.max(0, this.activeConnections - 1);
+          this.logger.debug('HTTP connection closed, active=%d', this.activeConnections);
+        });
+      });
+
       server.on('error', (error: unknown) => {
         this.logger.error('HTTP server error: %s', error instanceof Error ? error.message : String(error));
         reject(error instanceof Error ? error : new Error(String(error)));
+      });
+
+      // If the HTTP server closes unexpectedly, exit non-zero so a dev supervisor (e.g., nodemon)
+      // can restart the process. During an intentional shutdown we set isShuttingDown to true
+      // to avoid triggering a restart.
+      server.on('close', () => {
+        this.logger.info('HTTP server closed');
+        if (!this.isShuttingDown) {
+          setImmediate(() => {
+            process.exitCode = 1;
+            setTimeout(() => process.exit(1), 10);
+          });
+        }
       });
 
       this.httpServer = server;
@@ -201,6 +285,7 @@ export class WeaviateMcpRuntime {
   }
 
   async shutdown(): Promise<void> {
+    this.isShuttingDown = true;
     if (this.httpServer) {
       await new Promise<void>((resolve) => {
         this.httpServer?.close(() => resolve());
@@ -399,8 +484,29 @@ export class WeaviateMcpRuntime {
     }
 
     if (!availableCollections.includes(collectionName)) {
-      const list = availableCollections.length > 0 ? availableCollections.join(', ') : 'none';
-      throw new Error(`Collection '${collectionName}' was not found. Available collections: ${list}`);
+      const namesList = availableCollections.length > 0 ? availableCollections.join(', ') : 'none';
+      let descPart = '';
+      try {
+        const fullSchema = await this.weaviate.getSchema();
+        const classes: Array<{ class: string; description?: string }> = Array.isArray(fullSchema.classes)
+          ? fullSchema.classes
+          : [];
+        if (classes.length > 0) {
+          const listWithDescriptions = classes
+            .map((cls) => {
+              const name = cls.class ?? '<unknown>';
+              const desc = (cls.description ?? 'no description').toString();
+              return `${name}: ${desc}`;
+            })
+            .join('; ');
+          descPart = ` Descriptions: ${listWithDescriptions}`;
+        }
+      } catch {
+        // ignore and use names only
+      }
+      throw new Error(
+        `Collection '${collectionName}' was not found. Available collections: ${namesList}.${descPart}`
+      );
     }
 
     const schema = await this.weaviate.getClassSchema(collectionName);
