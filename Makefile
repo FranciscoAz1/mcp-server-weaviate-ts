@@ -36,8 +36,8 @@ lint:
 format:
 	npm run format
 
-# Run tests (placeholder)
-test:
+# Run tests (build first to ensure dist is current)
+test: build
 	node test/test-server.js
 
 # Docker build

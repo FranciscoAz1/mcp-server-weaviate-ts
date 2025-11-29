@@ -11,6 +11,8 @@ import { Logger } from './logger.js';
 import { WeaviateConnection } from './weaviate.js';
 
 const QUERY_TOOL_NAME = 'weaviate-query';
+const ORIGIN_TOOL_NAME = 'weaviate-origin';
+const FOLLOW_REF_TOOL_NAME = 'weaviate-follow-ref';
 const GENERATE_TOOL_NAME = 'weaviate-generate-text';
 const SCHEMA_TEMPLATE_NAME = 'weaviate-schema';
 const SCHEMA_URI_TEMPLATE = 'weaviate://schema/{collection}';
@@ -32,6 +34,29 @@ const QUERY_INPUT_SHAPE = {
     .optional()
 } satisfies z.ZodRawShape;
 
+const ORIGIN_INPUT_SHAPE = {
+  query: z.string().min(1, 'query is required'),
+  collection: z.string().min(1, 'collection cannot be empty'),
+  targetProperties: z
+    .array(z.string().min(1))
+    .min(1, 'targetProperties requires at least one property'),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(50, 'limit must be <= 50')
+    .optional()
+} satisfies z.ZodRawShape;
+
+const FOLLOW_REF_INPUT_SHAPE = {
+  query: z.string().min(1, 'query is required'),
+  collection: z.string().min(1, 'collection cannot be empty'),
+  baseProps: z.array(z.string().min(1)).min(1, 'baseProps requires at least one property'),
+  refProp: z.string().min(1, 'refProp is required'),
+  refProps: z.array(z.string().min(1)).min(1, 'refProps requires at least one property'),
+  limit: z.number().int().positive().max(50).optional()
+} satisfies z.ZodRawShape;
+
 const GENERATE_INPUT_SHAPE = {
   query: z.string().min(1, 'query is required'),
   collection: z
@@ -49,9 +74,13 @@ const GENERATE_INPUT_SHAPE = {
 } satisfies z.ZodRawShape;
 
 const QUERY_INPUT_SCHEMA = z.object(QUERY_INPUT_SHAPE);
+const ORIGIN_INPUT_SCHEMA = z.object(ORIGIN_INPUT_SHAPE);
+const FOLLOW_REF_INPUT_SCHEMA = z.object(FOLLOW_REF_INPUT_SHAPE);
 const GENERATE_INPUT_SCHEMA = z.object(GENERATE_INPUT_SHAPE);
 
 type QueryInput = z.infer<typeof QUERY_INPUT_SCHEMA>;
+type OriginInput = z.infer<typeof ORIGIN_INPUT_SCHEMA>;
+type FollowRefInput = z.infer<typeof FOLLOW_REF_INPUT_SCHEMA>;
 type GenerateInput = z.infer<typeof GENERATE_INPUT_SCHEMA>;
 
 interface TransportWrapper {
@@ -342,6 +371,100 @@ export class WeaviateMcpRuntime {
           }
 
           return response;
+        }
+      );
+    }
+
+    if (this.isToolDisabled(ORIGIN_TOOL_NAME)) {
+      this.logger.info('Tool %s disabled via configuration', ORIGIN_TOOL_NAME);
+    } else {
+      type OriginInput = z.infer<typeof ORIGIN_INPUT_SCHEMA>;
+      const ORIGIN_INPUT_SCHEMA = z.object(ORIGIN_INPUT_SHAPE);
+      this.server.registerTool(
+        ORIGIN_TOOL_NAME,
+        {
+          title: 'Weaviate Hybrid Query with cross-references',
+          description: 'Query objects from a Weaviate collection using hybrid search and get next-hop connections',
+          inputSchema: ORIGIN_INPUT_SHAPE
+        },
+        async ({ query, collection, targetProperties, limit }: OriginInput) => {
+          const { name: targetCollection, schema } = await this.resolveCollection(collection);
+          const validatedProperties = await this.validateTargetProperties(targetCollection, targetProperties, schema);
+          const effectiveLimit = limit ?? 5;
+
+          // For now queryOrigin expects Etapa-style fields; it's safe when used on Etapa
+          // If used on other classes, it still returns collection info and connections.
+          const nl = await this.weaviate.queryOrigin(targetCollection, query, effectiveLimit, ['name']);
+          return { content: [{ type: 'text', text: nl }] };
+        }
+      );
+    }
+
+    if (this.isToolDisabled(FOLLOW_REF_TOOL_NAME)) {
+      this.logger.info('Tool %s disabled via configuration', FOLLOW_REF_TOOL_NAME);
+    } else {
+
+      type FollowRefInput = z.infer<typeof FOLLOW_REF_INPUT_SCHEMA>;
+      const FOLLOW_REF_INPUT_SCHEMA = z.object(FOLLOW_REF_INPUT_SHAPE);
+
+      this.server.registerTool(
+        FOLLOW_REF_TOOL_NAME,
+        {
+          title: 'Weaviate Follow Reference',
+          description: 'Query objects from a Weaviate collection using hybrid search and get next-hop connections by following a specific reference property, from a previous next-hop suggestion',
+          inputSchema: FOLLOW_REF_INPUT_SHAPE
+        },
+        async ({ query, collection, refProp, baseProps, refProps, limit }: FollowRefInput) => {
+          const { name: targetCollection, schema } = await this.resolveCollection(collection);
+          const classSchema = schema ?? (await this.weaviate.getClassSchema(targetCollection));
+
+          // Validate baseProps (exist in base class)
+          const effectiveBaseProps = baseProps && baseProps.length ? baseProps : ['name'];
+          await this.validateTargetProperties(targetCollection, effectiveBaseProps, classSchema);
+
+          // Validate that refProp exists and points to at least one target class
+          const rawProps: Array<any> = classSchema?.properties || [];
+          const ref = rawProps.find((p) => p?.name === refProp);
+          if (!ref) {
+            // Only surface properties that look like references (dataType contains a capitalized class name)
+            const refPropsOnly = rawProps
+              .filter((p) => Array.isArray(p?.dataType) && (p.dataType || []).some((dt: string) => /^[A-Z]/.test(dt)))
+              .map((p) => p.name);
+            const allowed = refPropsOnly.length > 0 ? refPropsOnly.join(', ') : rawProps.map((p) => p.name).join(', ');
+            throw new Error(`Reference property '${refProp}' does not exist on '${targetCollection}'. Available reference properties: ${allowed}`);
+          }
+          const targets: string[] = (ref.dataType || []).filter((dt: string) => /^[A-Z]/.test(dt));
+          if (!targets.length) {
+            throw new Error(`Property '${refProp}' on '${targetCollection}' does not appear to be a cross-reference (no target class in dataType).`);
+          }
+
+          // Validate refProps against target class(es) if provided
+          const effectiveRefProps = refProps && refProps.length ? refProps : ['name'];
+          try {
+            // Validate against the first target (common case); if differing schemas exist, skip strict validation
+            const firstTarget = targets[0];
+            const targetSchema = await this.weaviate.getClassSchema(firstTarget);
+            const allowedTargetProps = new Set((targetSchema?.properties || []).map((p: any) => p.name));
+            for (const p of effectiveRefProps) {
+              if (!allowedTargetProps.has(p)) {
+                throw new Error(`Ref property '${p}' not found on target class '${firstTarget}'. Available: ${Array.from(allowedTargetProps).join(', ')}`);
+              }
+            }
+          } catch (e) {
+            // If schema lookup fails, proceed without validation
+            this.logger.warn('Skipping strict refProps validation: %s', e instanceof Error ? e.message : String(e));
+          }
+
+          const effectiveLimit = limit ?? 5;
+            const nl = await this.weaviate.queryWithRefs(
+              targetCollection,
+              refProp,
+              query,
+              effectiveLimit,
+              effectiveBaseProps,
+              effectiveRefProps
+            );
+            return { content: [{ type: 'text', text: nl }] };
         }
       );
     }
