@@ -91,20 +91,24 @@ async function testMCPServer() {
         }
       }
     },
-    // {
-    //   jsonrpc: '2.0',
-    //   id: nextRequestId++,
-    //   method: 'tools/call',
-    //   params: {
-    //     name: 'weaviate-generate-text',
-    //     arguments: {
-    //       query: 'hello',
-    //       collection: 'Dataset',
-    //       targetProperties: ['text', 'file_path'],
-    //       limit: 1
-    //     }
-    //   }
-    // },
+    // test weaviate-origin tool
+    {
+      jsonrpc: '2.0',
+      id: nextRequestId++,
+      method: 'tools/call',
+      params: {
+        name: 'weaviate-origin',
+        arguments: {
+          query: 'hello',
+          collection: 'Dataset',
+          targetProperties: ['text', 'file_path'],
+          limit: 1
+        }
+      }
+    },
+    
+    // Uncomment to test weaviate-generate-text tool
+
     // {
     //   jsonrpc: '2.0',
     //   id: nextRequestId++,
